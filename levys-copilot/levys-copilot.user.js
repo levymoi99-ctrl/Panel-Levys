@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Levys Bazar Copiloto ML
 // @namespace    levysbazar.copiloto
-// @version      0.7.0
+// @version      0.8.0
 // @description  Copiloto integrado como un ítem más del menú de Mercado Libre (mismos diseños, colores y fuentes), autocargado en segundo plano: stock crítico Full, oportunidades sin usar, calendario comercial, margen real, competencia y tendencias propias — para Levys Bazar / TUSHKA (seller 107584006).
 // @author       Levys Bazar
 // @match        https://vendedores.mercadolibre.com.ar/*
@@ -1133,6 +1133,19 @@
     } catch (e) { /* nunca romper la página de ML por esto */ }
   }
 
+  // Competidores nuevos detectados por ml-bot-competencia (proceso Python
+  // aparte, corre en la PC) — ese bot escribe en el mismo documento de
+  // Firestore que ya usamos para costos/history (campo "competenciaNuevos").
+  // Acá SOLO lo leemos, nunca lo escribimos desde el panel, para no pisar
+  // lo que el bot subió. Si CLOUD_CONFIG no está configurado, no hace nada.
+  function pollCompetenciaExterna() {
+    if (!Cloud.enabled()) return Promise.resolve();
+    return Cloud.pull().then(cloud => {
+      live.competenciaNuevosVendedores = (cloud && Array.isArray(cloud.competenciaNuevos)) ? cloud.competenciaNuevos : [];
+      saveLive();
+    }).catch(e => console.warn('[Copiloto] no se pudo leer competenciaNuevos de la nube:', e && e.message));
+  }
+
   // Cada tarea tiene su propio intervalo — las livianas (Resumen) se piden
   // seguido, las pesadas (páginas HTML completas) unas pocas veces por día.
   const POLL_TASKS = [
@@ -1144,6 +1157,7 @@
     { key: 'ventas', ms: 6 * 60 * 60 * 1000, run: pollVentas },
     { key: 'reputacion', ms: 12 * 60 * 60 * 1000, run: pollReputacion },
     { key: 'competencia', ms: 12 * 60 * 60 * 1000, run: pollCompetencia },
+    { key: 'competencia_externa', ms: 30 * 60 * 1000, run: pollCompetenciaExterna },
   ];
 
   function backgroundPollTick() {
@@ -1252,6 +1266,11 @@
       ranking: live.competenciaRanking || null,
       gaps: (live.competenciaGaps || []).filter(g => g.requiresImprovement),
       headToHead: live.competenciaHeadToHead || null,
+      // Publicaciones donde ml-bot-competencia detectó un vendedor nuevo
+      // (más reciente primero) — viene de Firestore, no de scans de ML.
+      nuevosVendedores: (live.competenciaNuevosVendedores || [])
+        .slice()
+        .sort((a, b) => String((b && b.detectadoEn) || '').localeCompare(String((a && a.detectadoEn) || ''))),
     };
 
     // -- Tendencia propia (necesita >= 7 días de historial) --
@@ -1303,6 +1322,17 @@
         link: g.link,
       });
     });
+
+    if ((d.competencia.nuevosVendedores || []).length) {
+      const n0 = d.competencia.nuevosVendedores[0];
+      items.push({
+        sev: 60,
+        cls: 'critical',
+        label: d.competencia.nuevosVendedores.length + ' publicación(es) con competidor nuevo',
+        sub: (n0 && n0.titulo) ? ('Última: ' + n0.titulo.slice(0, 46)) : 'Detectado por el bot de competencia',
+        link: n0 ? n0.link : null,
+      });
+    }
 
     (d.oportunidadesSinUsar || []).forEach(o => {
       const ratio = o.total ? o.sinUsar / o.total : 0;
@@ -1591,7 +1621,8 @@
     const d = computeDetections();
     const posicionBajo = d.competencia.ranking && d.competencia.ranking.trend === 'negative';
     let alertCount = d.stockCritical.length + d.oportunidadesSinUsar.length + d.calendario.length +
-      d.competencia.gaps.length + (posicionBajo ? 1 : 0) + d.buenasOfertasSinUnir.length;
+      d.competencia.gaps.length + (posicionBajo ? 1 : 0) + d.buenasOfertasSinUnir.length +
+      d.competencia.nuevosVendedores.length;
     const priorities = buildPriorities(d);
 
     let html = '';
@@ -1740,6 +1771,23 @@
       }
     } else {
       html += '<div class="empty">Se pide solo en segundo plano (unas pocas veces por día).</div>';
+    }
+    // Nuevos competidores detectados por ml-bot-competencia (proceso Python
+    // aparte, en la PC) — vía Firestore, no vía scan de ML.
+    if (d.competencia.nuevosVendedores.length) {
+      html += '<div class="empty" style="margin:8px 0 6px">Nuevo competidor detectado (bot de competencia):</div>';
+      d.competencia.nuevosVendedores.slice(0, 12).forEach(n => {
+        const vendedoresTxt = (n.vendedores || [])
+          .map(v => esc(v.nombre || 'Vendedor') + (v.precio ? ' a $' + esc(v.precio) : ''))
+          .join(', ');
+        const fecha = n.detectadoEn ? new Date(n.detectadoEn).toLocaleDateString('es-AR') : '';
+        html += maybeLink(n.link, '<div class="alert critical linked">' + esc((n.titulo || n.itemId || 'Publicación').slice(0, 60)) + '</div>');
+        if (vendedoresTxt || fecha) {
+          html += '<div class="empty" style="margin:0 0 8px 4px">' + vendedoresTxt + (fecha ? (vendedoresTxt ? ' · ' : '') + fecha : '') + '</div>';
+        }
+      });
+    } else if (Cloud.enabled()) {
+      html += '<div class="empty" style="margin-top:8px">Sin competidores nuevos detectados por el bot, por ahora.</div>';
     }
     html += '</div></details>';
 

@@ -110,6 +110,20 @@ pero que ahí quedan sueltos en distintas pantallas. El panel te trae:
   y te mostramos únicamente lo que importa.
 - Ventas brutas cabeza a cabeza contra ese competidor.
 
+**Novedad v0.8 — competidor nuevo detectado (bot aparte)**: si tenés
+corriendo `ml-bot-competencia` (carpeta aparte del repo, un proceso de
+Python que revisa cada publicación tuya buscando vendedores nuevos en
+"Otras opciones de compra") y le completaste `FIREBASE_API_KEY` /
+`FIREBASE_PROJECT_ID` en su `.env`, esta misma sección "Competencia" suma
+un bloque con las publicaciones donde ese bot detectó un competidor nuevo
+— título, vendedor, precio y fecha, con link real a la publicación. El
+panel solo LEE esos datos (vía Firestore, el mismo documento compartido
+`shops/levysbazar` que ya usa para costos/history); nunca los escribe —
+el bot es el único dueño de esa información. Se refresca solo cada 30
+minutos mientras tengas la pestaña abierta. Si no tenés el bot corriendo
+o no configuraste Firebase para él, esta parte simplemente no aparece —
+el resto del panel sigue igual.
+
 ## Nueva propuesta sin unir (v0.6 — v0.7)
 Si venías usando el script separado de escaneo de propuestas nuevas
 (`mlnuevapropuestascan.user.js`, el que te generaba un CSV), esa misma

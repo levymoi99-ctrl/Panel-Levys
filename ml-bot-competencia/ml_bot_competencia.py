@@ -12,6 +12,9 @@ import requests
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
+import firebase_sync
+import novedades_competencia
+
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -83,6 +86,18 @@ ARCHIVO_EXCLUIDOS = Path(
     os.getenv("COMP_ARCHIVO_EXCLUIDOS", str(BASE_DIR / "excluidos.txt"))
 )
 
+# Sincronización con el panel de Tampermonkey (levys-copilot.user.js), vía
+# el mismo proyecto de Firebase que ya usa ese script (shops/levysbazar).
+# Ninguno de los dos valores es secreto por sí solo (ver LEEME.md del
+# panel) -- lo que protege los datos son las reglas de Firestore. Si
+# quedan vacíos, la sincronización queda inerte: el bot sigue funcionando
+# 100% igual que antes, solo que el panel no ve sus avisos.
+FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY", "").strip()
+FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "").strip()
+ARCHIVO_NOVEDADES = Path(
+    os.getenv("COMP_ARCHIVO_NOVEDADES", str(BASE_DIR / "novedades_competencia.json"))
+)
+
 # Cuantos intentos de relanzar el navegador se hacen seguidos, dentro del
 # mismo ciclo, antes de resignarse y esperar al proximo INTERVALO_SEGUNDOS.
 MAX_INTENTOS_RELANZAR_NAVEGADOR = int(os.getenv("COMP_MAX_INTENTOS_RELANZAR", "3"))
@@ -127,6 +142,27 @@ def guardar_estado(estado: dict) -> None:
         archivo.flush()
         os.fsync(archivo.fileno())
     os.replace(archivo_temporal, ARCHIVO_ESTADO)
+
+
+def cargar_novedades() -> list:
+    if not ARCHIVO_NOVEDADES.exists():
+        return []
+    try:
+        with ARCHIVO_NOVEDADES.open("r", encoding="utf-8") as archivo:
+            data = json.load(archivo)
+            return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, OSError) as error:
+        log.error(f"No se pudo leer novedades_competencia.json previo: {error}")
+        return []
+
+
+def guardar_novedades(novedades: list) -> None:
+    archivo_temporal = ARCHIVO_NOVEDADES.with_suffix(ARCHIVO_NOVEDADES.suffix + ".tmp")
+    with archivo_temporal.open("w", encoding="utf-8") as archivo:
+        json.dump(novedades, archivo, ensure_ascii=False, indent=2)
+        archivo.flush()
+        os.fsync(archivo.fileno())
+    os.replace(archivo_temporal, ARCHIVO_NOVEDADES)
 
 
 def cargar_excluidos() -> set:
@@ -549,14 +585,18 @@ async def revisar_competencia(page, item_id: str, link: str) -> dict:
     return competidores
 
 
-def comparar_y_notificar(item_id: str, titulo: str, link: str, previos: dict, nuevos: dict) -> None:
+def comparar_y_notificar(item_id: str, titulo: str, link: str, previos: dict, nuevos: dict) -> list:
+    """Manda el aviso de Telegram si corresponde y devuelve la lista de
+    vendedores nuevos detectados (vacía si no hay ninguno) -- así el
+    llamador puede reusar exactamente el mismo resultado para armar el
+    evento que se sube a Firestore, sin recalcular la comparación."""
     previos = previos or {}
     nuevos = nuevos or {}
 
-    nuevos_vendedores = [v for v in nuevos if v not in previos]
+    nuevos_vendedores = novedades_competencia.detectar_vendedores_nuevos(previos, nuevos)
 
     if not nuevos_vendedores:
-        return
+        return nuevos_vendedores
 
     lineas = [
         "<b>Nuevo competidor detectado</b>",
@@ -575,6 +615,7 @@ def comparar_y_notificar(item_id: str, titulo: str, link: str, previos: dict, nu
 
     enviar_telegram("\n".join(lineas))
     log.info(f"Aviso enviado para {item_id}: nuevos={nuevos_vendedores}")
+    return nuevos_vendedores
 
 
 async def main() -> None:
@@ -668,6 +709,7 @@ async def main() -> None:
                     )
 
                 muro_login_detectado = False
+                eventos_este_ciclo = []
                 total_lote = len(lote)
                 for indice, (item_id, datos) in enumerate(lote.items(), start=1):
                     if indice % 25 == 0 or indice == total_lote:
@@ -703,7 +745,13 @@ async def main() -> None:
 
                         if not primera_vez:
                             previos = estado.get(item_id, {}).get("competidores", {})
-                            comparar_y_notificar(item_id, datos["titulo"], datos["link"], previos, competidores)
+                            vendedores_nuevos = comparar_y_notificar(item_id, datos["titulo"], datos["link"], previos, competidores)
+                            if vendedores_nuevos:
+                                eventos_este_ciclo.append(
+                                    novedades_competencia.construir_evento(
+                                        item_id, datos["titulo"], datos["link"], competidores, vendedores_nuevos
+                                    )
+                                )
 
                     # guardamos despues de cada publicacion: si el bot se corta,
                     # no se pierde el progreso ya revisado
@@ -714,6 +762,27 @@ async def main() -> None:
 
                 estado = nuevo_estado
                 guardar_estado(estado)
+
+                # Publicaciones con competidor nuevo -> Firestore, para que
+                # el panel de Tampermonkey las muestre. Guardamos local
+                # SIEMPRE (aunque Firebase no esté configurado, para no
+                # perder el historial); el push a la nube es best-effort:
+                # si falla, se reintenta solo en el próximo ciclo (subimos
+                # la lista completa vigente, no un delta).
+                novedades_actualizadas = novedades_competencia.fusionar_eventos(
+                    cargar_novedades(), eventos_este_ciclo
+                )
+                guardar_novedades(novedades_actualizadas)
+                if eventos_este_ciclo:
+                    log.info(f"{len(eventos_este_ciclo)} publicacion(es) con competidor nuevo este ciclo.")
+                if firebase_sync.configurado(FIREBASE_API_KEY, FIREBASE_PROJECT_ID):
+                    subido = firebase_sync.push_competencia_nuevos(
+                        FIREBASE_PROJECT_ID, FIREBASE_API_KEY, novedades_actualizadas
+                    )
+                    if subido:
+                        log.info(f"Sincronizado con el panel: {len(novedades_actualizadas)} publicacion(es) con competidor nuevo vigentes.")
+                    else:
+                        log.error("No se pudo sincronizar competenciaNuevos con Firestore este ciclo (se reintenta el proximo).")
 
                 if muro_login_detectado:
                     log.info("Ciclo interrumpido por muro de login. Se reintentara el mismo lote en el proximo ciclo.")

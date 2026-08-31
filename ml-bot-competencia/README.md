@@ -5,9 +5,11 @@ Bot de Python + Playwright que recorre las publicaciones de la tienda
 "Otras opciones de compra" de Mercado Libre. Cuando aparece un vendedor
 nuevo que antes no estaba, avisa por Telegram.
 
-No usa Firebase ni el panel de Tampermonkey — es un proceso aparte que
-corre en la PC (no en el navegador), pensado para dejarlo prendido en
-segundo plano.
+Es un proceso aparte del panel de Tampermonkey — corre en la PC (no en el
+navegador), pensado para dejarlo prendido en segundo plano. Opcionalmente
+sube sus avisos al mismo proyecto de Firebase que usa el panel, para que
+las publicaciones con competidor nuevo se vean directo ahí (ver
+"Sincronización con el panel" más abajo).
 
 ## Instalación
 
@@ -36,8 +38,42 @@ vuelta en adelante, avisa solo cuando aparece alguien nuevo.
 
 - `.env` — tiene el token real de Telegram.
 - `bot.log`, `competencia_conocida.json`, `rotacion_competencia.json`,
-  `excluidos.txt`, `chrome_profile_competencia/` — son datos/estado de
-  esta PC, se regeneran solos.
+  `novedades_competencia.json`, `excluidos.txt`,
+  `chrome_profile_competencia/` — son datos/estado de esta PC, se
+  regeneran solos.
+
+## Sincronización con el panel (Firestore)
+
+Si `FIREBASE_API_KEY` y `FIREBASE_PROJECT_ID` están completados en `.env`
+(ya vienen completados en `.env.example` con los del proyecto
+`panel-levys`, que es el mismo que usa `levys-copilot.user.js`), al final
+de cada ciclo el bot:
+
+1. Arma la lista de publicaciones con competidor nuevo detectado —
+   `novedades_competencia.py` la fusiona con lo que ya había (sin duplicar
+   por publicación: si el mismo item vuelve a tener novedades, se
+   actualiza esa misma fila) y descarta lo que hace más de 30 días que no
+   se refresca, para que la lista no crezca para siempre.
+2. La guarda local en `novedades_competencia.json` (siempre, aunque
+   Firebase no esté configurado — así no se pierde nada).
+3. Si Firebase está configurado, sube esa lista al campo
+   `competenciaNuevos` del mismo documento de Firestore que ya usa el
+   panel para costos/history (`shops/levysbazar`), usando el mismo
+   protocolo (auth anónima + `updateMask` para no pisar los otros campos).
+   El panel SOLO lee ese campo, nunca lo escribe — así nunca hay conflicto
+   sobre quién es dueño del dato.
+
+Si el push a Firestore falla un ciclo (sin internet, etc.), no se pierde
+nada: se reintenta solo, subiendo la lista completa vigente, en el
+próximo ciclo (3 horas después, por defecto).
+
+Tests de esta parte (fusión/vencimiento de la lista + las llamadas REST,
+con `requests` mockeado, nunca contra Firebase de verdad) en
+`test_novedades_y_firebase.py`:
+
+```bash
+python3 test_novedades_y_firebase.py
+```
 
 ## Reconexión automática (v2, agosto 2026)
 

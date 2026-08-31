@@ -7,6 +7,7 @@ bot.log
 *.log
 competencia_conocida.json
 rotacion_competencia.json
+novedades_competencia.json
 excluidos.txt
 
 # Perfil de Chrome persistente (cookies de sesion, cache, etc.)
