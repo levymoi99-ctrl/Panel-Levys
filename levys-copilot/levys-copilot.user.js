@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Levys Bazar Copiloto ML
 // @namespace    levysbazar.copiloto
-// @version      0.8.0
+// @version      0.9.0
 // @description  Copiloto integrado como un ítem más del menú de Mercado Libre (mismos diseños, colores y fuentes), autocargado en segundo plano: stock crítico Full, oportunidades sin usar, calendario comercial, margen real, competencia y tendencias propias — para Levys Bazar / TUSHKA (seller 107584006).
 // @author       Levys Bazar
 // @match        https://vendedores.mercadolibre.com.ar/*
@@ -352,6 +352,9 @@
           stockDeposito: stockMap.flex, stockFull: stockMap.fulfillment, price,
           qualityGoals: (r.quality || {}).goals, experienceGoals: (r.experience || {}).goals,
           familyId: (r.metadata || {}).familyId,
+          // foto real (la primera de la publicación) -- ya viene en el
+          // mismo objeto "product" de esta tabla, sin pedir nada extra.
+          foto: (prod.pictures && prod.pictures.urls && prod.pictures.urls[0]) || null,
           // link real de ML para editar esta publicación puntual (viene tal
           // cual de la propia página — no lo armamos nosotros).
           link: prod.redirectUrl || null,
@@ -403,6 +406,9 @@
           onTheWay: cellText('on-the-way'), notSuitable: cellText('not-suitable-for-sale'),
           suitable: cellText('suitable-for-sale'), aging: cellText('aging-stock'),
           timeToSellOut, riskRank: riskRank(timeToSellOut),
+          // foto real del producto -- ya viene en esta misma columna, sin
+          // pedir nada extra (la misma que ML muestra en su propia tabla).
+          foto: prod.image || null,
           // mismo patrón de URL que usa el propio tooltip de ML en esta
           // pantalla (?userProductId=...) para llevarte directo a esa
           // publicación en el listado.
@@ -1256,7 +1262,7 @@
       const esNeto = earnings != null;
       const margenBruto = base - cost;
       const margenPct = base ? (margenBruto / base * 100) : null;
-      return { id: p.id, title: p.title, familyId: p.familyId, link: p.link, price, cost, earnings, margenBruto, margenPct, esNeto };
+      return { id: p.id, title: p.title, familyId: p.familyId, link: p.link, foto: p.foto || null, price, cost, earnings, margenBruto, margenPct, esNeto };
     }).filter(Boolean);
 
     // -- Competencia (posición en tu categoría + brechas contra el rival
@@ -1300,6 +1306,7 @@
         label: (p.title || 'Producto').slice(0, 54),
         sub: p.timeToSellOut || 'Stock crítico en Full',
         link: p.link,
+        foto: p.foto || null,
       });
     });
 
@@ -1372,6 +1379,7 @@
         label: (m.title || 'Publicación').slice(0, 48) + ': margen ' + m.margenPct.toFixed(0) + '%',
         sub: m.esNeto ? 'Neto de la comisión de ML' : 'Estimado (todavía sin datos de earnings)',
         link: m.link,
+        foto: m.foto || null,
       });
     });
 
@@ -1440,6 +1448,23 @@
     }
     a.prio-item { cursor: pointer; }
     a.prio-item:hover { border-color: #3483fa; box-shadow: 0 1px 6px rgba(52,131,250,0.18); }
+    .item-photo, .prio-photo {
+      object-fit: contain; border: 1px solid #eee; border-radius: 4px; flex: none; background: #fff;
+    }
+    .item-photo { width: 48px; height: 48px; }
+    .prio-photo { width: 32px; height: 32px; margin-top: 1px; }
+    .item-photo-empty, .prio-photo-empty { background: #f5f5f5; }
+    .prio-photo.critical { border-color: #f23d4f; }
+    .prio-photo.opp { border-color: #3483fa; }
+    .prio-photo.cal { border-color: #ffb100; }
+    /* Fila con foto real + texto, para usar DENTRO de .alert (conserva el
+       borde de color y el fondo que ya distinguen critical/opp/cal) en vez
+       de una línea de texto suelta -- misma idea que ya usa "Nueva
+       propuesta sin unir" para publicaciones individuales. */
+    .alert-media { display: flex; gap: 10px; align-items: flex-start; }
+    .alert-media .item-body { flex: 1; min-width: 0; }
+    .alert-media .item-title { display: block; font-size: 13px; color: #333333; font-weight: 600; margin-bottom: 0; }
+    .alert-media .item-sub { display: block; font-size: 12px; color: #999999; margin-top: 2px; }
     .prio-dot { width: 8px; height: 8px; border-radius: 50%; margin-top: 5px; flex: none; }
     .prio-dot.critical { background: #f23d4f; }
     .prio-dot.opp { background: #3483fa; }
@@ -1575,6 +1600,18 @@
     return innerHtml;
   }
 
+  // Foto real de la publicación (o un placeholder gris del mismo tamaño si
+  // no la tenemos) — mismo patrón en todas las listas de publicaciones del
+  // panel (Nueva propuesta, Stock crítico, Margen real, Prioridades), para
+  // que se vea como una publicación real de ML y no como una línea de texto
+  // suelta. 'item' = 48px (fila normal), 'prio' = 32px (tarjeta compacta).
+  function photoHtml(url, size, extraCls) {
+    const cls = (size === 'prio' ? 'prio-photo' : 'item-photo') + (extraCls ? ' ' + extraCls : '');
+    return url
+      ? '<img src="' + esc(url) + '" alt="" class="' + cls + '" />'
+      : '<div class="' + cls + ' ' + (size === 'prio' ? 'prio-photo' : 'item-photo') + '-empty"></div>';
+  }
+
   // Arma el HTML del área de acción de una fila de "Nueva propuesta sin
   // unir", según en qué paso está su vista previa/confirmación (npPreview).
   // Nunca dispara nada solo -- siempre requiere el click explícito del
@@ -1636,7 +1673,7 @@
         const tag = p.link ? 'a' : 'div';
         const attrs = p.link ? ' href="' + esc(p.link) + '" target="_blank" rel="noopener"' : '';
         html += '<' + tag + ' class="prio-item"' + attrs + '>' +
-          '<span class="prio-dot ' + p.cls + '"></span>' +
+          (p.foto ? photoHtml(p.foto, 'prio', p.cls) : '<span class="prio-dot ' + p.cls + '"></span>') +
           '<span class="prio-text"><b>' + esc(p.label) + '</b><span class="sub">' + esc(p.sub) + '</span></span>' +
           (p.link ? '<span class="prio-chev">›</span>' : '') +
           '</' + tag + '>';
@@ -1650,7 +1687,11 @@
     html += '<details class="sec" data-sec-key="stock_critico"><summary>Stock crítico en Full (' + d.stockCritical.length + ')</summary><div class="dbody">';
     if (d.stockCritical.length) {
       d.stockCritical.slice(0, 12).forEach(p => {
-        html += maybeLink(p.link, '<div class="alert critical linked">' + esc((p.title || '').slice(0, 50)) + ' &mdash; ' + esc(p.timeToSellOut) + '</div>');
+        html += maybeLink(p.link, '<div class="alert critical linked"><div class="alert-media">' +
+          photoHtml(p.foto, 'item') +
+          '<div class="item-body"><span class="item-title">' + esc((p.title || '').slice(0, 60)) + '</span>' +
+          '<span class="item-sub">' + esc(p.timeToSellOut) + '</span></div>' +
+          '</div></div>');
       });
       if (d.stockCritical.length > 12) html += '<div class="empty">+' + (d.stockCritical.length - 12) + ' más</div>';
     } else if (live.fullStock) {
@@ -1732,8 +1773,10 @@
         const cost = costs[p.familyId];
         const m = d.margenReal.find(x => x.familyId === p.familyId);
         const titleHtml = esc((p.title || '').slice(0, 34)) + (m && !m.esNeto ? ' <span style="color:#999">(estimado)</span>' : '');
-        html += '<div class="kpi-row"><span>' + maybeLink(p.link, titleHtml) + '</span>' +
-          '<span>$<input class="cost-input" type="number" min="0" step="1" data-fam="' + esc(p.familyId) + '" value="' + (cost !== undefined ? cost : '') + '" placeholder="costo" />' +
+        html += '<div class="kpi-row"><span style="display:flex;align-items:center;gap:8px;min-width:0">' +
+          photoHtml(p.foto, 'prio') +
+          '<span style="min-width:0">' + maybeLink(p.link, titleHtml) + '</span></span>' +
+          '<span style="flex:none">$<input class="cost-input" type="number" min="0" step="1" data-fam="' + esc(p.familyId) + '" value="' + (cost !== undefined ? cost : '') + '" placeholder="costo" />' +
           (m ? ' <b style="color:' + (m.margenPct >= 0 ? '#0ca30c' : '#d03b3b') + '">' + m.margenPct.toFixed(0) + '%</b>' : '') +
           '</span></div>';
       });

@@ -82,6 +82,26 @@ sección, toda fila que tiene un link real de Mercado Libre atrás (no
 inventado — lo sacamos de datos que ML mismo nos da) es clickeable y te
 lleva ahí directo.
 
+## Fotos reales en las publicaciones (v0.9)
+"Stock crítico en Full" y "Margen real" ahora muestran la foto real de
+cada publicación (la misma que ya usa Mercado Libre en esas pantallas —
+no pedimos nada nuevo, ya venía en los mismos datos que veníamos leyendo,
+solo no la estábamos usando) al lado del título, en vez de una línea de
+texto suelta. "Prioridades ahora" también muestra esa foto cuando el
+ítem es una publicación puntual (stock crítico, margen bajo), con el
+borde del color de la severidad (rojo = crítico, azul = oportunidad,
+amarillo = calendario) para no perder esa señal. Es la misma idea que ya
+usaba "Nueva propuesta sin unir" desde la v0.7, ahora aplicada en todo el
+panel: si es una publicación puntual, se ve como una publicación real de
+Mercado Libre, no como texto plano.
+
+Quedan sin foto (a propósito, no porque falte terminar): "Oportunidades
+sin usar", "Calendario comercial" y "Competencia" (los gaps contra tu
+rival) — esas secciones son resúmenes agregados de varias publicaciones a
+la vez (por ejemplo "294 publicaciones con exhibición pendiente"), no una
+publicación puntual, así que no hay una sola foto real que mostrar sin
+inventar cuál.
+
 ## Margen real
 En la sección "Margen real" vas a ver tus publicaciones con un campo para
 cargar el costo de cada una. Lo cargás una sola vez (podés volver a
