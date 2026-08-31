@@ -110,6 +110,46 @@ pero que ahí quedan sueltos en distintas pantallas. El panel te trae:
   y te mostramos únicamente lo que importa.
 - Ventas brutas cabeza a cabeza contra ese competidor.
 
+## Nueva propuesta sin unir (v0.6 — v0.7)
+Si venías usando el script separado de escaneo de propuestas nuevas
+(`mlnuevapropuestascan.user.js`, el que te generaba un CSV), esa misma
+lógica ahora vive adentro del Copiloto — **podés desactivar ese script
+aparte**, ya no hace falta.
+
+El panel recorre solo, en segundo plano, todo tu catálogo en Promociones
+(igual que hacías vos a mano con "Escanear") y arma una sección nueva,
+**"Nueva propuesta sin unir"**, con el mismo filtro que ya tenía tu
+script (solo publicaciones sin cuotas, con una oferta ACTIVA o PROGRAMADA
+vigente, y una propuesta nueva que no empeora precio final ni lo que
+recibís más de $200). Como es la fuente más pesada (recorre página por
+página todo el catálogo), se actualiza cada 4 horas, no todo el tiempo.
+
+Cada fila muestra el detalle completo tal cual lo vería en Promociones —
+**foto real de la publicación, precio de lista, depósito, envío**, nombre
+de la promo, fechas, aporte propio, aporte de Mercado Libre, precio final
+y lo que recibís (con el mismo desglose de costos que el ⓘ de ML, si lo
+pasás el mouse por encima) — sin abrir un Excel aparte ni cruzar nada a
+mano.
+
+**Novedad v0.7 — confirmar la propuesta desde acá mismo.** Gracias al HAR
+real que grabaste, ahora sé exactamente qué llamadas hace Mercado Libre
+cuando aceptás una propuesta (las mismas dos que hace su propia pantalla:
+pedir el modal real, y confirmarlo). Cada fila con acción disponible
+tiene un botón **"Ver y confirmar"**: al tocarlo, le pedimos a Mercado
+Libre en vivo la vista previa real (mismos precios y recibís que verías
+en su propio modal) y recién ahí aparece un botón **"Confirmar"** — nada
+se envía hasta ese segundo click explícito tuyo, igual que en la pantalla
+real. Si algo no coincide con lo que esperabas en la vista previa, tocá
+"Cancelar" y no se manda nada.
+
+Una aclaración honesta: probé esta secuencia de punta a punta contra Mercado
+Libre con un tipo de promoción (una campaña oficial tipo "Cyber Fest"), no
+específicamente con el tipo "aporte de Mercado Libre" que esta sección
+filtra — pero es la misma llamada, con la misma forma, para cualquier tipo
+de promoción. Te recomiendo probarlo primero en una publicación de bajo
+riesgo antes de confiar en él a lo grande, y si algo se ve raro en la vista
+previa, cancelá y contámelo.
+
 ## Sincronización en la nube (v0.5, opcional)
 Hasta la v0.4, el costo que cargabas en "Margen real" y tu historial
 ("Tendencia propia") vivían solo en el navegador de esa PC puntual — si

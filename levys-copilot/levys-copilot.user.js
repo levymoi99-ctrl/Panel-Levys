@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Levys Bazar Copiloto ML
 // @namespace    levysbazar.copiloto
-// @version      0.5.1
+// @version      0.7.0
 // @description  Copiloto integrado como un ítem más del menú de Mercado Libre (mismos diseños, colores y fuentes), autocargado en segundo plano: stock crítico Full, oportunidades sin usar, calendario comercial, margen real, competencia y tendencias propias — para Levys Bazar / TUSHKA (seller 107584006).
 // @author       Levys Bazar
 // @match        https://vendedores.mercadolibre.com.ar/*
@@ -808,6 +808,331 @@
     });
   }
 
+  // ======================================================================
+  // 4.5 NUEVA PROPUESTA SIN UNIR — portado 1:1 de tu script real
+  //     "ML Nueva Propuesta - Escáner" (v1.1.0, mismos umbrales, mismo
+  //     descarte de cajas relámpago de un día, mismo criterio de buena
+  //     oferta). Acá corre en segundo plano en vez de en un panel flotante
+  //     aparte, y el escaneo sigue siendo 100% de solo lectura igual que el
+  //     original. Desde v0.7, cada fila puede además CONFIRMARSE desde acá
+  //     mismo (ver npFetchModal/npConfirmModal más abajo) — a diferencia
+  //     del escaneo, esa es una acción real que escribe en tu cuenta, y
+  //     nunca se dispara sola: siempre requiere que abras la vista previa
+  //     real (con los datos que Mercado Libre te devuelve en ese momento) y
+  //     confirmes con un segundo click explícito, igual que en la pantalla
+  //     real de ML.
+  // ======================================================================
+  const NP_STATUS_LABELS = ['ACTIVA', 'PROGRAMADA', 'PAUSADA', 'FINALIZADA'];
+  const NP_PAGE_SIZE = 25;
+  const NP_MAX_DIFF_PRECIO_FINAL = 200; // la nueva puede ser hasta $200 más cara
+  const NP_MAX_CAIDA_RECIBIS = 200; // el recibís nuevo puede bajar hasta $200
+
+  // Estado transitorio (NO se guarda en Store/live ni se sincroniza a la
+  // nube) de la vista previa de confirmación por fila, indexado por id de
+  // publicación: { estado: 'idle'|'cargando'|'preview'|'confirmando'|'ok'|'error', modal, mensaje }
+  const npPreview = {};
+
+  function npGetCsrfToken() {
+    const meta = document.querySelector('meta[name="csrf-token"]');
+    return meta ? meta.content : '';
+  }
+  function npParseMoney(s) {
+    if (s == null) return null;
+    if (typeof s === 'number') return s;
+    const cleaned = String(s).replace(/\$/g, '').replace(/[^\d.,-]/g, '').trim();
+    if (!cleaned) return null;
+    if (/\ba\b/i.test(String(s))) return null; // "$X a $Y" (rango de familia): no sirve
+    const normalized = cleaned.replace(/\./g, '').replace(',', '.');
+    const n = parseFloat(normalized);
+    return isNaN(n) ? null : n;
+  }
+  function npNormalizeItemId(rawId) {
+    if (rawId == null) return null;
+    const bare = String(rawId).replace(/^#/, '').trim();
+    if (!/^\d+$/.test(bare)) return null;
+    return 'MLA' + bare;
+  }
+  function npFindAllWithKeys(obj, keys) {
+    const out = [];
+    const seen = new Set();
+    (function walk(o) {
+      if (!o || typeof o !== 'object' || seen.has(o)) return;
+      seen.add(o);
+      if (keys.every(k => Object.prototype.hasOwnProperty.call(o, k))) out.push(o);
+      for (const k in o) walk(o[k]);
+    })(obj);
+    return out;
+  }
+  function npFindBoxesMatching(json, regex) {
+    const out = [];
+    const seen = new Set();
+    (function walk(o) {
+      if (!o || typeof o !== 'object' || seen.has(o)) return;
+      seen.add(o);
+      if (Array.isArray(o.columns)) {
+        const col0 = o.columns[0];
+        if (col0 && Array.isArray(col0.lines)) {
+          const matches = col0.lines.some(l => {
+            const c = l && l.primaryText && l.primaryText.content;
+            return typeof c === 'string' && regex.test(c);
+          });
+          if (matches) out.push(o);
+        }
+      }
+      for (const k in o) walk(o[k]);
+    })(json);
+    return out;
+  }
+  function npGetDateLineText(col0) {
+    if (!col0 || !Array.isArray(col0.lines)) return null;
+    for (const l of col0.lines) {
+      const pt = l && l.primaryText;
+      if (pt && pt.color === 'gray' && typeof pt.content === 'string') return pt.content;
+    }
+    return null;
+  }
+  function npExtractBoxInfo(box) {
+    const info = { estado: null, nombre: null, fechas: null, aportePropio: null, aporteML: null, precioFinal: null, recibis: null };
+    const col0 = box.columns && box.columns[0];
+    if (col0 && Array.isArray(col0.lines)) {
+      for (const l of col0.lines) {
+        const c = l && l.primaryText && l.primaryText.content;
+        if (typeof c !== 'string') continue;
+        const cUpper = c.trim().toUpperCase();
+        if (NP_STATUS_LABELS.includes(cUpper)) info.estado = cUpper;
+        else if (c.trim() === '¡Nueva propuesta!') info.estado = info.estado || 'NUEVA_PROPUESTA';
+      }
+      const nombrePartes = col0.lines.filter(l => {
+        const pt = l && l.primaryText;
+        if (!pt || typeof pt.content !== 'string') return false;
+        if (pt.color === 'gray') return false;
+        const cUpper = pt.content.trim().toUpperCase();
+        if (NP_STATUS_LABELS.includes(cUpper)) return false;
+        if (pt.content.trim() === '¡Nueva propuesta!') return false;
+        return true;
+      }).map(l => l.primaryText.content.trim());
+      info.nombre = nombrePartes.join(' - ') || null;
+      info.fechas = npGetDateLineText(col0);
+    }
+    const col1 = box.columns && box.columns[1];
+    if (col1 && Array.isArray(col1.lines)) {
+      for (const l of col1.lines) {
+        const prim = l && l.primaryText && l.primaryText.content;
+        const sec = l && l.secondaryText && l.secondaryText.content;
+        if (typeof sec === 'string' && /mercado libre/i.test(sec)) info.aporteML = npParseMoney(prim);
+        else if (info.aportePropio == null) info.aportePropio = npParseMoney(prim);
+      }
+    }
+    function readMoneyColumn(col) {
+      if (!col || !Array.isArray(col.lines)) return null;
+      for (const l of col.lines) {
+        const plain = l && l.primaryText && l.primaryText.content;
+        if (typeof plain === 'string' && /\d/.test(plain)) {
+          const v = npParseMoney(plain);
+          if (v != null) return v;
+        }
+      }
+      for (const l of col.lines) {
+        if (l && l.type === 'charges' && l.totalCharges && l.totalCharges.value != null) {
+          const v = npParseMoney(l.totalCharges.value);
+          if (v != null) return v;
+        }
+      }
+      return null;
+    }
+    // El detalle de costos real (Precio/Cargo por vender/Costo por unidad
+    // vendida/Envío/Impuestos) que ML muestra en el tooltip ⓘ al lado de
+    // "Recibís" -- lo guardamos tal cual viene, sin inventar ningún campo.
+    function readChargesDetail(col) {
+      if (!col || !Array.isArray(col.lines)) return null;
+      for (const l of col.lines) {
+        if (l && l.type === 'charges' && l.totalCharges && l.totalCharges.detail) return l.totalCharges.detail;
+      }
+      return null;
+    }
+    info.precioFinal = readMoneyColumn(box.columns && box.columns[2]);
+    info.recibis = readMoneyColumn(box.columns && box.columns[3]);
+    info.recibisDetalle = readChargesDetail(box.columns && box.columns[3]);
+    // El botón real de acción (Participar/Mejorar/Modificar) -- puede estar
+    // en cualquier columna (normalmente la última). Lo guardamos completo
+    // (itemId, actionType, urlCallback) porque es justo lo que hace falta
+    // para pedirle a Mercado Libre el modal real de confirmación -- nunca
+    // inventamos su forma, es la que ML mismo manda en el JSON.
+    info.button = null;
+    if (Array.isArray(box.columns)) {
+      for (const col of box.columns) {
+        if (!col || !Array.isArray(col.lines)) continue;
+        for (const l of col.lines) {
+          if (l && l.type === 'button' && l.button) { info.button = l.button; break; }
+        }
+        if (info.button) break;
+      }
+    }
+    return info;
+  }
+  function npEsFlashDeUnDia(info) {
+    const f = info.fechas && info.fechas.trim();
+    if (!f) return false;
+    return /^\d{1,2}\s*\/\s*[a-záéíóúñ]+\.?$/i.test(f) && !/\bal\b/i.test(f);
+  }
+  function npProcessRowGroup(groupJson) {
+    const rowInfos = npFindAllWithKeys(groupJson, ['extraInfo', 'id', 'title']);
+    if (!rowInfos.length) return null;
+    const rowInfo = rowInfos[0];
+    const cuotas = (rowInfo.extraInfo || '').trim();
+    if (cuotas !== 'Sin cuotas') return null;
+    const itemId = npNormalizeItemId(rowInfo.id);
+    if (!itemId) return null;
+    const allStatusBoxes = npFindBoxesMatching(groupJson, /^ACTIVA$|^PROGRAMADA$|^PAUSADA$|^FINALIZADA$/i).map(npExtractBoxInfo);
+    const validStatusBoxes = allStatusBoxes.filter(info => !npEsFlashDeUnDia(info));
+    const tieneActivaOProgramada = validStatusBoxes.some(b => b.estado === 'ACTIVA' || b.estado === 'PROGRAMADA');
+    if (!tieneActivaOProgramada) return null;
+    const nuevaBoxesRaw = npFindBoxesMatching(groupJson, /Nueva propuesta/i);
+    const nuevaBoxes = nuevaBoxesRaw.map(npExtractBoxInfo).filter(b => b.aporteML != null);
+    if (!nuevaBoxes.length) return null;
+    const activaCandidates = validStatusBoxes.filter(b => b.estado === 'ACTIVA');
+    const programadaCandidates = validStatusBoxes.filter(b => b.estado === 'PROGRAMADA');
+    const activa = activaCandidates[0] || programadaCandidates[0] || null;
+    const rows = [];
+    for (const nb of nuevaBoxes) {
+      if (!activa || activa.precioFinal == null || activa.recibis == null || nb.precioFinal == null || nb.recibis == null) continue;
+      const okPrecio = nb.precioFinal <= activa.precioFinal + NP_MAX_DIFF_PRECIO_FINAL;
+      const okRecibis = nb.recibis >= activa.recibis - NP_MAX_CAIDA_RECIBIS;
+      if (!(okPrecio && okRecibis)) continue;
+      rows.push({
+        id: itemId,
+        title: rowInfo.title || '',
+        // Estos 4 campos ya venían en el mismo JSON que ya pedíamos (el de
+        // items/refresh) -- tu script original nunca los leía, pero están
+        // ahí: son los mismos que Mercado Libre usa para pintar la fila real
+        // en Promociones. Nada inventado.
+        foto: (Array.isArray(rowInfo.pictures) && rowInfo.pictures[0]) ? rowInfo.pictures[0].replace(/^http:/, 'https:') : null,
+        precioLista: rowInfo.price || null,
+        deposito: rowInfo.info || null,
+        envio: rowInfo.shippingInfo || null,
+        promoNombre: nb.nombre || '',
+        fechas: nb.fechas || '',
+        aportePropio: nb.aportePropio,
+        aporteML: nb.aporteML,
+        precioFinal: nb.precioFinal,
+        recibis: nb.recibis,
+        recibisDetalle: nb.recibisDetalle || null,
+        // Botón real de "Participar" tal cual lo manda ML (itemId,
+        // actionType, urlCallback) -- lo necesitamos para pedir el modal de
+        // confirmación real. Si por algún motivo esta caja puntual no trae
+        // botón, la fila se muestra igual pero sin la opción de confirmar
+        // desde acá (nunca inventamos un botón que no vino en el JSON).
+        boton: nb.button || null,
+        // ML no nos da (ni tu script original navega a) un link puntual a
+        // esta caja específica — te llevamos al Centro de Promociones real
+        // en vez de inventar un filtro que capaz no funciona.
+        link: 'https://www.mercadolibre.com.ar/publicaciones/listado/promos/',
+      });
+    }
+    return rows.length ? rows : null;
+  }
+  function npGetRowGroups(json) {
+    return npFindAllWithKeys(json, ['id', 'bricks']).filter(o => typeof o.id === 'string' && o.id.indexOf('row_group-') === 0);
+  }
+  function npGetPaginationTotal(json) {
+    const pag = npFindAllWithKeys(json, ['total', 'offset', 'limit']);
+    if (pag.length && typeof pag[0].total === 'number') return pag[0].total;
+    return null;
+  }
+  function npFetchPage(page) {
+    const url = '/publicaciones/listado/promos/api/items/refresh?viewId=promos&search=&filters=&sort=&page=' + page;
+    return fetch(url, {
+      method: 'GET',
+      credentials: 'same-origin',
+      headers: { accept: 'application/json, text/plain, */*', 'x-requested-with': 'XMLHttpRequest', 'x-csrf-token': npGetCsrfToken() },
+    }).then(r => (r.ok ? r.json() : null));
+  }
+
+  // ---- Confirmar una "Nueva propuesta" desde acá mismo (v0.7) ----
+  // Esta es la MISMA secuencia de 2 pasos que hace la propia pantalla de
+  // Mercado Libre cuando tocás "Participar"/"Mejorar" y después "Confirmar"
+  // en el modal -- reconstruida a partir de un HAR real que grabaste vos
+  // (no inventada): 1) pedimos el modal real con los datos actualizados
+  // (precio, recibís, firma), 2) sólo si el usuario confirma explícitamente
+  // acá, mandamos la confirmación con esos mismos datos tal cual vinieron.
+  // Pedir el modal es de solo lectura (no une nada todavía); el paso que
+  // realmente une la promoción es npConfirmModal.
+  function npFetchModal(boton) {
+    if (!boton || !boton.urlCallback) return Promise.resolve(null);
+    return fetch('/publicaciones/listado/promos/api/modal-ondemand', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/json', accept: 'application/json, text/plain, */*', 'x-requested-with': 'XMLHttpRequest', 'x-csrf-token': npGetCsrfToken() },
+      body: JSON.stringify({ urlCallback: boton.urlCallback, itemId: boton.itemId, viewId: 'promos', actionType: boton.actionType }),
+    }).then(r => (r.ok ? r.json() : null)).then(json => (json && json.data && json.data.data) ? json.data.data : null);
+  }
+  // Arma el body real de confirm-from-modal a partir de la respuesta de
+  // npFetchModal, tal cual lo arma la propia pantalla de ML (verificado
+  // contra un HAR real: resource_elements = defaultParams + los 6 campos
+  // fijos de abajo, tomados literal del ejemplo capturado). Función pura,
+  // sin red, para poder testearla sin pegarle a Mercado Libre.
+  function npBuildConfirmBody(modalData) {
+    if (!modalData || !modalData.defaultParams) return null;
+    const finalPriceValue = modalData.finalPrice && modalData.finalPrice.value != null ? modalData.finalPrice.value : null;
+    return {
+      resource_elements: Object.assign({}, modalData.defaultParams, {
+        pricePercentage: null,
+        pricePrimePercentage: null,
+        pricePrime: null,
+        price: finalPriceValue,
+        tycChecked: false,
+        addItemToCampaignCheck: false,
+        recoCampaignId: null,
+      }),
+      urlCallback: modalData.urlCallback,
+      impersonalized: false,
+      viewId: modalData.viewId,
+      itemId: modalData.itemId,
+      actionType: modalData.actionId,
+    };
+  }
+  function npConfirmModal(modalData) {
+    const body = npBuildConfirmBody(modalData);
+    if (!body) return Promise.resolve({ ok: false, message: 'Faltan datos del modal, no se puede confirmar.' });
+    return fetch('/publicaciones/listado/promos/api/confirm-from-modal', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/json', accept: 'application/json, text/plain, */*', 'x-requested-with': 'XMLHttpRequest', 'x-csrf-token': npGetCsrfToken() },
+      body: JSON.stringify(body),
+    }).then(r => r.json().then(json => ({ ok: r.ok, json })).catch(() => ({ ok: r.ok, json: null })))
+      .then(({ ok, json }) => ({
+        ok: ok && !!(json && json.data),
+        message: (json && json.data && json.data.message) || (ok ? 'Listo.' : 'Mercado Libre rechazó la confirmación.'),
+      }))
+      .catch(err => ({ ok: false, message: 'Error de red: ' + (err && err.message || err) }));
+  }
+  // Recorre TODO el catálogo en Promos, página por página (igual que tu
+  // script manual), con una pausa chica entre cada una para no verse como
+  // un pico de tráfico raro. Es la tarea más pesada del poller, por eso
+  // corre cada varias horas, no cada minuto.
+  async function pollNuevaPropuesta() {
+    const rows = [];
+    let page = 1, totalPages = null;
+    try {
+      while (page <= 60) { // techo de seguridad (~1500 publicaciones)
+        const json = await npFetchPage(page);
+        if (!json) break;
+        if (page === 1) {
+          const total = npGetPaginationTotal(json);
+          if (total != null) totalPages = Math.ceil(total / NP_PAGE_SIZE);
+        }
+        const groups = npGetRowGroups(json);
+        if (!groups.length) break;
+        groups.forEach(g => { const r = npProcessRowGroup(g); if (r) rows.push(...r); });
+        if (totalPages && page >= totalPages) break;
+        page++;
+        await new Promise(res => setTimeout(res, 250 + Math.round(Math.random() * 250)));
+      }
+      live.buenasOfertasSinUnir = rows;
+      saveLive();
+    } catch (e) { /* nunca romper la página de ML por esto */ }
+  }
+
   // Cada tarea tiene su propio intervalo — las livianas (Resumen) se piden
   // seguido, las pesadas (páginas HTML completas) unas pocas veces por día.
   const POLL_TASKS = [
@@ -815,6 +1140,7 @@
     { key: 'publicaciones', ms: 4 * 60 * 60 * 1000, run: pollPublicaciones },
     { key: 'full_stock', ms: 4 * 60 * 60 * 1000, run: pollFullStock },
     { key: 'promos', ms: 4 * 60 * 60 * 1000, run: pollPromos },
+    { key: 'nueva_propuesta', ms: 4 * 60 * 60 * 1000, run: pollNuevaPropuesta },
     { key: 'ventas', ms: 6 * 60 * 60 * 1000, run: pollVentas },
     { key: 'reputacion', ms: 12 * 60 * 60 * 1000, run: pollReputacion },
     { key: 'competencia', ms: 12 * 60 * 60 * 1000, run: pollCompetencia },
@@ -887,6 +1213,12 @@
       // verificado) en vez de inventar un filtro que capaz no funciona.
       link: 'https://www.mercadolibre.com.ar/publicaciones/listado/promos/',
     })).filter(t => t.sinUsar > 0);
+
+    // -- Nueva propuesta sin unir (portado de tu script de escaneo real) --
+    // Cada fila ya viene con toda la info que vos verías en Promociones
+    // (título, nombre de la promo, fechas, aporte propio, aporte ML,
+    // precio final, recibís) — no resumimos ni recortamos nada acá.
+    out.buenasOfertasSinUnir = live.buenasOfertasSinUnir || [];
 
     // -- Calendario comercial cruzado con catálogo --
     out.calendario = upcomingCalendarAlerts(live.publicaciones);
@@ -983,6 +1315,16 @@
       });
     });
 
+    if ((d.buenasOfertasSinUnir || []).length) {
+      items.push({
+        sev: 45,
+        cls: 'opp',
+        label: d.buenasOfertasSinUnir.length + ' nueva(s) propuesta(s) de promoción sin unir',
+        sub: 'Mejoran o igualan tu oferta activa — mirá el detalle abajo',
+        link: 'https://www.mercadolibre.com.ar/publicaciones/listado/promos/',
+      });
+    }
+
     (d.calendario || []).forEach(c => {
       items.push({
         sev: Math.max(15, 70 - c.days * 2),
@@ -1057,6 +1399,8 @@
     .empty { color: #999999; font-size: 13px; }
     .cost-input { width: 70px; font-size: 12px; padding: 4px 6px; border: 1px solid #cccccc; border-radius: 4px; }
     a.link { color: #3483fa; text-decoration: none; }
+    .np-btn-preview, .np-btn-confirm, .np-btn-cancel { border: none; border-radius: 4px; padding: 6px 12px; font-size: 12px; cursor: pointer; background: #3483fa; color: #ffffff; }
+    .np-btn-cancel, .secondary.np-btn-preview { background: #eeeeee; color: #333333; }
 
     .prio-list { margin-bottom: 20px; }
     .prio-item {
@@ -1201,12 +1545,53 @@
     return innerHtml;
   }
 
+  // Arma el HTML del área de acción de una fila de "Nueva propuesta sin
+  // unir", según en qué paso está su vista previa/confirmación (npPreview).
+  // Nunca dispara nada solo -- siempre requiere el click explícito del
+  // usuario en cada paso (Ver y confirmar → Confirmar), igual que la
+  // pantalla real de Mercado Libre.
+  function npRenderAccion(o, st) {
+    const fmtMoney = v => (v == null ? '—' : (typeof v === 'string' ? v : '$' + Math.round(v).toLocaleString('es-AR')));
+    if (st.estado === 'ok') {
+      return '<div style="color:#0ca30c;font-size:12px">&#10003; ' + esc(st.mensaje || 'Confirmado en Mercado Libre.') + ' (se termina de sacar de esta lista en el próximo escaneo)</div>';
+    }
+    if (st.estado === 'cargando') {
+      return '<div class="empty" style="margin:0">Pidiendo los datos reales a Mercado Libre…</div>';
+    }
+    if (st.estado === 'confirmando') {
+      return '<div class="empty" style="margin:0">Confirmando con Mercado Libre…</div>';
+    }
+    if (st.estado === 'preview' && st.modal) {
+      const m = st.modal;
+      let h = '<div style="background:#f6f6fa;border-radius:6px;padding:8px 10px;font-size:12px">';
+      h += '<div style="font-weight:600;margin-bottom:4px">' + esc(m.title || 'Confirmá los detalles de la promoción') + '</div>';
+      h += '<div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:6px">';
+      if (m.originalPrice) h += '<span>Precio original: <b>' + esc(m.originalPrice.formattedValue || fmtMoney(m.originalPrice.value)) + '</b></span>';
+      if (m.finalPrice) h += '<span>Precio final: <b>' + fmtMoney(m.finalPrice.value) + '</b></span>';
+      if (m.totalCharges) h += '<span>Recibís: <b>' + esc(m.totalCharges.value) + '</b></span>';
+      h += '</div>';
+      h += '<div style="color:#999;font-size:11px;margin-bottom:6px">Esto es lo que Mercado Libre te devolvió recién, en vivo — si algo no coincide con lo que esperabas, cancelá y no confirmes.</div>';
+      h += '<button class="np-btn-confirm" data-np-id="' + esc(o.id) + '">Confirmar</button> ';
+      h += '<button class="np-btn-cancel secondary" data-np-id="' + esc(o.id) + '">Cancelar</button>';
+      h += '</div>';
+      return h;
+    }
+    if (st.estado === 'error') {
+      return '<div style="color:#d03b3b;font-size:12px;margin-bottom:6px">' + esc(st.mensaje || 'Algo falló.') + '</div>' +
+        '<button class="np-btn-preview secondary" data-np-id="' + esc(o.id) + '">Reintentar</button>';
+    }
+    if (o.boton) {
+      return '<button class="np-btn-preview" data-np-id="' + esc(o.id) + '">Ver y confirmar</button>';
+    }
+    return maybeLink(o.link, '<span style="color:#3483FA;font-size:12px">Confirmar en Mercado Libre →</span>');
+  }
+
   function render() {
     ensurePanel();
     const d = computeDetections();
     const posicionBajo = d.competencia.ranking && d.competencia.ranking.trend === 'negative';
     let alertCount = d.stockCritical.length + d.oportunidadesSinUsar.length + d.calendario.length +
-      d.competencia.gaps.length + (posicionBajo ? 1 : 0);
+      d.competencia.gaps.length + (posicionBajo ? 1 : 0) + d.buenasOfertasSinUnir.length;
     const priorities = buildPriorities(d);
 
     let html = '';
@@ -1231,7 +1616,7 @@
     html += '</div>';
 
     // Stock crítico
-    html += '<details class="sec"><summary>Stock crítico en Full (' + d.stockCritical.length + ')</summary><div class="dbody">';
+    html += '<details class="sec" data-sec-key="stock_critico"><summary>Stock crítico en Full (' + d.stockCritical.length + ')</summary><div class="dbody">';
     if (d.stockCritical.length) {
       d.stockCritical.slice(0, 12).forEach(p => {
         html += maybeLink(p.link, '<div class="alert critical linked">' + esc((p.title || '').slice(0, 50)) + ' &mdash; ' + esc(p.timeToSellOut) + '</div>');
@@ -1245,7 +1630,7 @@
     html += '</div></details>';
 
     // Oportunidades sin usar
-    html += '<details class="sec"><summary>Oportunidades sin usar (' + d.oportunidadesSinUsar.length + ')</summary><div class="dbody">';
+    html += '<details class="sec" data-sec-key="oportunidades"><summary>Oportunidades sin usar (' + d.oportunidadesSinUsar.length + ')</summary><div class="dbody">';
     if (d.oportunidadesSinUsar.length) {
       d.oportunidadesSinUsar.forEach(o => {
         html += maybeLink(o.link, '<div class="alert opp linked">' + esc(OPORTUNIDAD_LABELS[o.subtype] || o.subtype) + ': ' + o.sinUsar + ' de ' + o.total + ' sin resolver</div>');
@@ -1257,8 +1642,46 @@
     }
     html += '</div></details>';
 
+    // Nueva propuesta sin unir — detalle completo por publicación, igual
+    // que lo mostraría Mercado Libre en Promociones (foto, precio,
+    // depósito, envío reales), con confirmación real en dos pasos desde
+    // acá mismo (vista previa real de ML + un segundo click explícito).
+    html += '<details class="sec" data-sec-key="nueva_propuesta"><summary>Nueva propuesta sin unir (' + d.buenasOfertasSinUnir.length + ')</summary><div class="dbody">';
+    if (d.buenasOfertasSinUnir.length) {
+      const fmtMoney = v => (v == null ? '—' : '$' + Math.round(v).toLocaleString('es-AR'));
+      d.buenasOfertasSinUnir.forEach(o => {
+        const st = npPreview[o.id] || { estado: 'idle' };
+        html += '<div class="alert opp linked" style="display:block;padding:10px 12px">';
+        html += '<div style="display:flex;gap:10px">';
+        html += o.foto
+          ? '<img src="' + esc(o.foto) + '" alt="" style="width:48px;height:48px;object-fit:contain;border:1px solid #eee;border-radius:4px;flex:none;background:#fff" />'
+          : '<div style="width:48px;height:48px;border:1px solid #eee;border-radius:4px;flex:none;background:#f5f5f5"></div>';
+        html += '<div style="flex:1;min-width:0">';
+        html += maybeLink(o.link, '<b>' + esc((o.title || o.id || '').slice(0, 60)) + '</b>');
+        html += '<div style="margin-top:2px;color:#777;font-size:11px">' + esc(o.id) +
+          (o.precioLista ? ' · ' + esc(o.precioLista) : '') +
+          (o.deposito ? ' · ' + esc(o.deposito) : '') +
+          (o.envio ? ' · ' + esc(o.envio) : '') + '</div>';
+        html += '<div style="margin-top:4px;color:#555;font-size:12px">' + esc(o.promoNombre || 'Nueva propuesta') + (o.fechas ? ' · ' + esc(o.fechas) : '') + '</div>';
+        html += '</div></div>';
+        html += '<div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:14px;font-size:12px;color:#333">' +
+          '<span>Aporte propio: <b>' + fmtMoney(o.aportePropio) + '</b></span>' +
+          '<span>Aporte ML: <b>' + fmtMoney(o.aporteML) + '</b></span>' +
+          '<span>Precio final: <b>' + fmtMoney(o.precioFinal) + '</b></span>' +
+          '<span' + (o.recibisDetalle ? ' title="' + esc((o.recibisDetalle.costs || []).map(c => c.label + ': ' + c.value).join('\n')) + '"' : '') + '>Recibís: <b>' + fmtMoney(o.recibis) + (o.recibisDetalle ? ' ⓘ' : '') + '</b></span>' +
+          '</div>';
+        html += '<div class="np-action" style="margin-top:8px" data-np-id="' + esc(o.id) + '">' + npRenderAccion(o, st) + '</div>';
+        html += '</div>';
+      });
+    } else if (live.buenasOfertasSinUnir) {
+      html += '<div class="empty">No hay propuestas nuevas pendientes por ahora.</div>';
+    } else {
+      html += '<div class="empty">Se escanea solo en segundo plano cada varias horas (o visitá Publicaciones &gt; Promos).</div>';
+    }
+    html += '</div></details>';
+
     // Calendario comercial
-    html += '<details class="sec"><summary>Calendario comercial · 30 días (' + d.calendario.length + ')</summary><div class="dbody">';
+    html += '<details class="sec" data-sec-key="calendario"><summary>Calendario comercial · 30 días (' + d.calendario.length + ')</summary><div class="dbody">';
     if (d.calendario.length) {
       d.calendario.forEach(c => {
         const link = (c.items[0] || {}).link || null;
@@ -1270,7 +1693,7 @@
     html += '</div></details>';
 
     // Margen real (costo cargado a mano)
-    html += '<details class="sec"><summary>Margen real</summary><div class="dbody">';
+    html += '<details class="sec" data-sec-key="margen_real"><summary>Margen real</summary><div class="dbody">';
     if (live.publicaciones && live.publicaciones.length) {
       const costs = Store.get('costs', {});
       html += '<div class="empty" style="margin-bottom:8px">Cargá el costo una vez por producto. El % ya descuenta la comisión de ML cuando tenemos ese dato (si no, es estimado sobre precio bruto).</div>';
@@ -1289,7 +1712,7 @@
     html += '</div></details>';
 
     // Tendencia propia
-    html += '<details class="sec"><summary>Tendencia propia</summary><div class="dbody">';
+    html += '<details class="sec" data-sec-key="tendencia_propia"><summary>Tendencia propia</summary><div class="dbody">';
     if (d.tendenciaPropia.puntos >= 2) {
       const delta = d.tendenciaPropia.ultimo - d.tendenciaPropia.primero;
       const pct = d.tendenciaPropia.primero ? (delta / d.tendenciaPropia.primero * 100).toFixed(1) : '?';
@@ -1300,7 +1723,7 @@
     html += '</div></details>';
 
     // Competencia
-    html += '<details class="sec"><summary>Competencia</summary><div class="dbody">';
+    html += '<details class="sec" data-sec-key="competencia"><summary>Competencia</summary><div class="dbody">';
     if (d.competencia.ranking) {
       const r = d.competencia.ranking;
       const arrow = r.trend === 'negative' ? '&#8595;' : (r.trend === 'positive' ? '&#8593;' : '&rarr;');
@@ -1321,7 +1744,7 @@
     html += '</div></details>';
 
     // KPIs generales
-    html += '<details class="sec"><summary>Números de hoy</summary><div class="dbody">';
+    html += '<details class="sec" data-sec-key="numeros_hoy"><summary>Números de hoy</summary><div class="dbody">';
     if (live.resumenCards) {
       const rc = live.resumenCards;
       html += '<div class="kpi-row"><span>Ventas brutas 7d</span><span class="v">$' + esc(rc.sales7d.amount) + '</span></div>';
@@ -1332,7 +1755,18 @@
     html += '<div class="kpi-row"><span>Datos capturados</span><span class="v">' + (live.updatedAt ? new Date(live.updatedAt).toLocaleString('es-AR') : 'todavía ninguno') + '</span></div>';
     html += '</div></details>';
 
+    // render() se llama seguido (cada minuto, y ahora también después de
+    // cada paso de "Ver y confirmar"/"Confirmar") -- sin esto, cada
+    // llamada reconstruía el HTML entero y te cerraba de nuevo cualquier
+    // sección que hubieras abierto a mano. Guardamos qué secciones estaban
+    // abiertas ANTES de tirar el HTML viejo, y las volvemos a abrir después.
+    const openSecKeys = new Set(
+      Array.from(panelBody.querySelectorAll('details.sec[open]')).map(d => d.getAttribute('data-sec-key')).filter(Boolean)
+    );
     panelBody.innerHTML = html;
+    panelBody.querySelectorAll('details.sec').forEach(d => {
+      if (openSecKeys.has(d.getAttribute('data-sec-key'))) d.setAttribute('open', '');
+    });
 
     panelBody.querySelectorAll('.cost-input').forEach(inp => {
       inp.addEventListener('change', () => {
@@ -1345,6 +1779,55 @@
         render();
       });
       inp.addEventListener('click', e => e.stopPropagation());
+    });
+
+    // Nueva propuesta sin unir: cada paso requiere un click explícito del
+    // usuario (Ver y confirmar → Confirmar) -- nunca se dispara solo.
+    panelBody.querySelectorAll('.np-btn-preview').forEach(btn => {
+      btn.addEventListener('click', async e => {
+        e.stopPropagation();
+        const id = btn.getAttribute('data-np-id');
+        const row = (live.buenasOfertasSinUnir || []).find(r => r.id === id);
+        if (!row || !row.boton) return;
+        npPreview[id] = { estado: 'cargando' };
+        render();
+        try {
+          const modal = await npFetchModal(row.boton);
+          npPreview[id] = modal
+            ? { estado: 'preview', modal }
+            : { estado: 'error', mensaje: 'Mercado Libre no devolvió los datos reales -- probá de nuevo en unos minutos.' };
+        } catch (err) {
+          npPreview[id] = { estado: 'error', mensaje: 'Error de red: ' + ((err && err.message) || err) };
+        }
+        render();
+      });
+    });
+    panelBody.querySelectorAll('.np-btn-cancel').forEach(btn => {
+      btn.addEventListener('click', e => {
+        e.stopPropagation();
+        delete npPreview[btn.getAttribute('data-np-id')];
+        render();
+      });
+    });
+    panelBody.querySelectorAll('.np-btn-confirm').forEach(btn => {
+      btn.addEventListener('click', async e => {
+        e.stopPropagation();
+        const id = btn.getAttribute('data-np-id');
+        const st = npPreview[id];
+        if (!st || st.estado !== 'preview') return;
+        npPreview[id] = { estado: 'confirmando' };
+        render();
+        const result = await npConfirmModal(st.modal);
+        npPreview[id] = result.ok
+          ? { estado: 'ok', mensaje: result.message }
+          : { estado: 'error', mensaje: result.message };
+        render();
+        // Si confirmó, actualizamos el escaneo real en segundo plano para
+        // que la fila se termine de sacar de la lista con datos reales
+        // (no la borramos nosotros a mano -- dejamos que el próximo
+        // escaneo confirme que ML ya no la muestra como pendiente).
+        if (result.ok) pollNuevaPropuesta().then(render);
+      });
     });
 
     if (badgeCountEl) {
