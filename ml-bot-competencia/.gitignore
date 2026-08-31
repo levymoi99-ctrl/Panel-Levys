@@ -1,0 +1,18 @@
+# Secretos y config real - nunca se sube
+.env
+.env.competencia
+
+# Estado y logs generados en runtime - son datos de esta PC, no codigo
+bot.log
+*.log
+competencia_conocida.json
+rotacion_competencia.json
+excluidos.txt
+
+# Perfil de Chrome persistente (cookies de sesion, cache, etc.)
+chrome_profile_competencia/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/

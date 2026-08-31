@@ -1,0 +1,4 @@
+# Publicaciones que el bot NO debe revisar.
+# Copia este archivo como "excluidos.txt" en la misma carpeta.
+# Un ID de publicacion (MLA...) por linea. Ejemplo:
+# MLA55883060
